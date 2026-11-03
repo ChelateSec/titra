@@ -1,0 +1,64 @@
+name: release
+
+# Build the prebuilt titra binaries the Action downloads, and attach them to
+# the release (and to the major-version tag the Action resolves, e.g. v1).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and attach binaries to (e.g. v1 or v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Test before publishing
+        run: |
+          go vet ./...
+          go test -count=1 ./...
+          node --test test/action.test.js
+
+      - name: Build binaries
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          mkdir -p dist
+          while read -r goos goarch ext; do
+            out="dist/titra_${goos}_${goarch}${ext}"
+            echo "building $out"
+            CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch \
+              go build -ldflags "-s -w -X main.version=$tag" -o "$out" .
+          done <<'TARGETS'
+          linux amd64
+          linux arm64
+          darwin amd64
+          darwin arm64
+          windows amd64 .exe
+          TARGETS
+          ( cd dist && sha256sum titra_* > SHA256SUMS )
+          ls -la dist
+
+      - name: Publish to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "$tag" --notes "Titra $tag"
+          gh release upload "$tag" dist/* --clobber

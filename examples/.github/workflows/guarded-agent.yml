@@ -1,0 +1,47 @@
+# Example: an AI issue-triage agent, guarded by Titra.
+#
+# This is the dangerous-by-default pattern behind Clinejection, the gemini-cli
+# TrustIssues compromise, and GitLost: an agent triggered by an outsider's issue,
+# reading the issue body, holding a write token. Shrike flags this workflow as
+# critical. Titra makes it safe to run: it watches every action the agent takes
+# (and the whole job around it) and blocks the ones that cross a line — push, PR
+# approval, publish, exfil. One line, and the report posts itself when the job ends.
+name: AI Issue Triage (guarded)
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read        # least privilege; the agent cannot push
+  issues: write
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false   # keep the token out of .git/config
+
+      # One line. From here on, every process, connection and credential read in
+      # the job is watched, and dangerous agent actions are blocked in real time.
+      # Start in monitor, flip to enforce once you trust it. The run report posts
+      # to the job summary automatically — no report step to add.
+      - name: Titra
+        uses: ChelateSec/titra@v1
+        with:
+          mode: enforce
+          # Titra for Organizations (paid, optional): live dashboard, PR checks,
+          # org-wide policy. Uncomment to connect:
+          # server: https://app.chelate.tech
+          # token: ${{ secrets.TITRA_TOKEN }}
+
+      # Your agent step, unchanged. It now runs behind Titra.
+      - name: Run triage agent
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Triage issue #${{ github.event.issue.number }}.
+            Read the issue, pick one label, and apply it. Nothing else.

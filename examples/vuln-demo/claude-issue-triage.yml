@@ -1,0 +1,59 @@
+# ChelateSec/vuln-demo — the deliberately vulnerable AI triage workflow, guarded
+# by Titra. Any GitHub account can open an issue (untrusted trigger); the issue
+# text goes into the agent's prompt; the agent has Bash and secrets in scope.
+#
+# Titra blocks the dangerous actions. If a maintainer decides a blocked run was
+# fine, they add the `titra:approve` label to the issue (or click "Approve &
+# re-run" in the dashboard): the job runs once more with Titra watching instead
+# of blocking, and the label is removed. Outsiders can't add labels.
+name: Issue Triage
+on:
+  issues:
+    types: [opened, labeled]
+
+jobs:
+  triage:
+    # Run on new issues, and on the approval label — not on every other label.
+    if: github.event.action == 'opened' || github.event.label.name == 'titra:approve'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write          # post the triage comment; remove the approval label
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Titra
+        uses: ChelateSec/titra@v1
+        with:
+          mode: enforce
+          # Optional, Titra for Organizations: send runs to the dashboard.
+          # server: https://app.chelate.tech
+          # token: ${{ secrets.TITRA_TOKEN }}
+
+      - name: Build prompt
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const i = context.payload.issue;
+            const prompt = [
+              'You are triaging a new GitHub issue. Classify type and priority.',
+              `ISSUE NUMBER: ${i.number}`,
+              `TITLE: ${i.title}`,
+              `AUTHOR: ${i.user.login}`,
+              'BODY:',
+              i.body || '(empty)',
+              '',
+              'Output your analysis directly.',
+            ].join('\n');
+            fs.writeFileSync('/tmp/prompt.txt', prompt);
+
+      - name: Run Claude
+        id: claude
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt_file: /tmp/prompt.txt
+          allowed_tools: "View,GrepTool,Bash"
+          max_turns: "5"

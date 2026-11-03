@@ -1,0 +1,74 @@
+name: "Titra"
+description: "Watch what AI agents do in your CI job and block the dangerous actions, in real time."
+author: "Chelate Sec"
+branding:
+  icon: "shield"
+  color: "green"
+
+inputs:
+  mode:
+    description: "monitor | dry-run | enforce. Start in monitor; flip to enforce when you trust it."
+    required: false
+    default: "monitor"
+  policy:
+    description: "Path to a Titra policy file. If empty, the built-in secure defaults are used."
+    required: false
+    default: ""
+  tools:
+    description: "Comma-separated tools to guard. Empty uses the built-in set (git, gh, curl, npm, ...)."
+    required: false
+    default: ""
+  trace:
+    description: "Watch the whole job with the kernel (every process, connection and credential read), not only guarded commands. Needs a Linux runner with sudo."
+    required: false
+    default: "true"
+  dns:
+    description: "With trace on, resolve outbound connections to domain names."
+    required: false
+    default: "true"
+  egress:
+    description: "Network egress control (Linux), opt-in. on: only allowed domains are reachable; blocked in enforce mode, recorded in monitor. audit: record only. off (default): no control."
+    required: false
+    default: "off"
+  disable-sudo:
+    description: "Remove sudo for the rest of the job once Titra's guards are up, so nothing in the job can switch them off. Leave false if a later step needs sudo."
+    required: false
+    default: "false"
+  allowed-domains:
+    description: "Extra network destinations this job is expected to reach, comma-separated (e.g. api.mycorp.com,*.internal)."
+    required: false
+    default: ""
+  report:
+    description: "Post the run report to the job summary and set the check result automatically when the job ends."
+    required: false
+    default: "true"
+  fail-on:
+    description: "Fail the job if an action was blocked (block), on any finding (any), or never (off)."
+    required: false
+    default: "block"
+  server:
+    description: "Titra dashboard URL (Titra for Organizations). Streams every action and the run report there, posts the verdict on PRs, and pulls your org-wide policy."
+    required: false
+    default: ""
+  token:
+    description: "Your organization's Titra token. Store it as a secret named TITRA_TOKEN and pass it in from the workflow."
+    required: false
+    default: ""
+  approve-label:
+    description: "Label a maintainer adds to an issue or PR to approve one re-run that Titra watches instead of blocks. Only people with triage/write access can add labels. Empty disables approvals."
+    required: false
+    default: "titra:approve"
+  github-token:
+    description: "Token used to remove the approval label after the approved run, so each approval works once."
+    required: false
+    default: ${{ github.token }}
+  go-version:
+    description: "Go version used to build the guard."
+    required: false
+    default: "1.22"
+
+runs:
+  using: "node24"
+  main: "action/index.js"
+  post: "action/post.js"
+  post-if: "always()"

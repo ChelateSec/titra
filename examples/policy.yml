@@ -1,0 +1,77 @@
+# Example custom Titra policy.
+#
+# Point the action at it:
+#   - uses: ChelateSec/titra@v1
+#     with:
+#       mode: enforce
+#       policy: examples/policy.yml
+#
+# Rules are evaluated in order; the first match wins. A rule matches when its
+# tool matches (empty = any tool) and its args_regex matches the arguments.
+version: 1
+mode: enforce
+default: allow
+
+rules:
+  # --- allowlist a few agent actions explicitly (first match wins) ----------
+  - id: allow-gh-read
+    description: Reading PRs and issues is fine
+    action: allow
+    severity: info
+    match:
+      tool: gh
+      args_regex: '(pr|issue)\s+(view|list|status)'
+
+  # --- the dangerous set ----------------------------------------------------
+  - id: block-git-push
+    description: Agent must not push code to the repository
+    action: block
+    severity: critical
+    match:
+      tool: git
+      args_regex: '(^|\s)push(\s|$)'
+
+  - id: block-git-force
+    description: Agent must not rewrite history
+    action: block
+    severity: high
+    match:
+      tool: git
+      args_regex: '--force|\s-f(\s|$)|push.*\+'
+
+  - id: block-pr-approval
+    description: Agent must not approve or merge pull requests
+    action: block
+    severity: critical
+    match:
+      tool: gh
+      args_regex: 'pr\s+(review|merge)'
+
+  - id: block-workflow-dispatch
+    description: Agent must not trigger other workflows (privilege-escalation pivot)
+    action: block
+    severity: high
+    match:
+      tool: gh
+      args_regex: 'workflow\s+run|actions/workflows/.+/dispatches'
+
+  - id: block-workflow-file-write
+    description: Agent must not rewrite workflow or agent-config files
+    action: block
+    severity: high
+    match:
+      args_regex: '\.github/workflows/|(^|/)CLAUDE\.md|\.titra/'
+
+  - id: block-release-publish
+    description: Agent must not publish packages or releases
+    action: block
+    severity: critical
+    match:
+      args_regex: '(^|\s)(npm|pnpm|yarn)\s+publish|gh\s+release\s+create|twine\s+upload'
+
+  - id: block-credential-read
+    description: Agent read a credential store (exfiltration primitive)
+    action: block
+    severity: high
+    match:
+      args_regex: '\.git/config|/proc/\d+/environ|\.npmrc|\.env(\s|$)|id_rsa|\.aws/credentials'

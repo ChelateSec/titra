@@ -1,0 +1,231 @@
+# Titra CI. Runs on every push and PR, on real GitHub runners, so a broken
+# Action can't reach a release. The e2e job loads the Action exactly the way
+# customers do (uses: ./), then recreates the real-world bypass that made
+# v1.0.1 miss an injected `npm install`: actions/setup-node putting its own npm
+# ahead of Titra's shims on PATH.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Go tests + cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+      - name: lint workflows and action metadata
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+          ./actionlint -color -ignore 'invalid runner name "node24"' .github/workflows/*.yml examples/vuln-demo/*.yml
+      - name: vet and test
+        run: |
+          test -z "$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }
+          go vet ./...
+          go test -count=1 ./...
+      - name: build every release target
+        run: |
+          for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            echo "building $t"
+            GOOS=${t%/*} GOARCH=${t#*/} CGO_ENABLED=0 go build -o /dev/null .
+          done
+
+  action:
+    name: Action script tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node --test test/action.test.js
+
+  e2e:
+    name: End-to-end on a real runner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5      # the local action builds the guard from source
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Titra (from this commit)
+        uses: ./
+        with:
+          mode: enforce
+          trace: "true"
+          egress: "on"
+          fail-on: "off"        # this job asserts the blocks itself
+
+      # Recreate the bypass: a setup step after Titra shadows its npm shim.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: PATH really is shadowed (sanity)
+        run: |
+          echo "npm resolves to: $(command -v npm)"
+          case "$(command -v npm)" in *titra*) echo "expected setup-node to shadow the shim"; exit 1;; esac
+
+      - name: Claude Code hook blocks the injected install anyway
+        run: |
+          hook=$(jq -r '.hooks.PreToolUse[].hooks[].command' ~/.claude/settings.json | grep claude-hook)
+          test -x "$hook"
+          set +e
+          echo '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"npm install git+https://github.com/ChelateSec/does-not-exist.git"}}' | "$hook"
+          code=$?
+          set -e
+          echo "hook exit: $code"
+          test "$code" -eq 2
+          echo '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"npm --version"}}' | "$hook"
+
+      - name: Shims block a push and let normal git through
+        run: |
+          git status --short >/dev/null
+          if git push origin HEAD:refs/heads/titra-ci-must-not-exist 2>err.txt; then
+            echo "push was not blocked"; exit 1
+          fi
+          cat err.txt
+          grep -q "titra BLOCKED" err.txt
+
+      - name: Egress — allowed hosts work, everything else is refused
+        run: |
+          curl -fsS -o /dev/null -m 15 https://api.github.com/zen
+          echo "api.github.com: reachable"
+          if curl -sS -o /dev/null -m 10 https://example.com; then echo "example.com reachable"; exit 1; fi
+          if curl -sS -o /dev/null -m 10 https://1.1.1.1; then echo "raw IP reachable"; exit 1; fi
+          if python3 -c "import socket; socket.create_connection(('1.1.1.1', 443), timeout=5)"; then echo "python socket connected"; exit 1; fi
+          if dig +time=3 +tries=1 @8.8.8.8 example.com | grep -q "status: NOERROR"; then echo "direct DNS worked"; exit 1; fi
+          echo "example.com, raw IP, python socket and direct DNS: all refused"
+
+      - name: Write guard — the agent can't write outside the checkout
+        run: |
+          hook=$(jq -r '.hooks.PreToolUse[].hooks[].command' ~/.claude/settings.json | grep claude-hook)
+          # These are commands an agent would send, so $GITHUB_ENV must stay unexpanded.
+          # shellcheck disable=SC2016
+          for cmd in 'echo NODE_OPTIONS=--require=/tmp/x.js >> "$GITHUB_ENV"' 'echo x >> ~/.bashrc' 'echo x > .git/hooks/post-checkout'; do
+            set +e
+            jq -n --arg c "$cmd" --arg cwd "$GITHUB_WORKSPACE" '{tool_name:"Bash",tool_input:{command:$c},cwd:$cwd}' | "$hook"
+            code=$?
+            set -e
+            echo "$cmd -> $code"
+            test "$code" -eq 2
+          done
+          jq -n --arg cwd "$GITHUB_WORKSPACE" '{tool_name:"Bash",tool_input:{command:"echo ok > notes.txt"},cwd:$cwd}' | "$hook"
+
+      - name: The runner itself still works with egress on (artifact upload)
+        uses: actions/upload-artifact@v4
+        with:
+          name: egress-smoke
+          path: README.md
+
+      - name: Egress diagnostics (only on failure)
+        if: failure()
+        run: |
+          echo "--- nsswitch hosts"; grep '^hosts' /etc/nsswitch.conf || true
+          echo "--- resolv.conf"; cat /etc/resolv.conf || true
+          echo "--- /etc/hosts"; cat /etc/hosts || true
+          echo "--- allowed IPs"; sudo iptables -S TITRA_ALLOW 2>&1 | head -50 || true
+          echo "--- DNS log (last 40)"; sudo tail -40 "$TITRA_STATE"/dns*.jsonl 2>&1 || true
+          echo "--- firewall rejects"; sudo dmesg 2>/dev/null | grep titra-egress | tail -20 || true
+
+      - name: The run report records every block
+        run: |
+          sudo -E "$TITRA_BIN" report --format json --out report.json >/dev/null || true
+          jq -e '.status == "blocked"' report.json
+          for rule in block-untrusted-package-source block-git-push egress-not-allowed write-outside-workspace; do
+            jq -e --arg r "$rule" '[.blocked[].rule_id] | index($r) != null' report.json >/dev/null || { echo "missing $rule"; jq '.blocked' report.json; exit 1; }
+            echo "recorded: $rule"
+          done
+          jq -e '[.blocked[] | select(.rule_id == "egress-not-allowed") | .args[0]] | any(startswith("example.com"))' report.json
+          jq -e '.traced == true' report.json
+
+  disable-sudo:
+    name: disable-sudo holds on a real runner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+      - uses: ./
+        with:
+          mode: enforce
+          egress: "on"
+          disable-sudo: "true"
+          fail-on: "off"
+      - name: Nothing in the job can become root or switch Titra off
+        run: |
+          if sudo -n true 2>/dev/null; then echo "sudo still works"; exit 1; fi
+          if sudo -n iptables -F 2>/dev/null; then echo "could flush the firewall"; exit 1; fi
+          if sudo -n /usr/local/sbin/titra-root egress stop --state /tmp 2>/dev/null; then echo "could stop egress"; exit 1; fi
+          if curl -sS -o /dev/null -m 10 https://example.com; then echo "egress not enforced"; exit 1; fi
+          echo "sudo, firewall flush, egress stop: all refused; egress still enforced"
+      - name: The report still gets the root-only evidence
+        run: |
+          sudo -n /usr/local/sbin/titra-root collect
+          "$TITRA_BIN" report --format json --out report.json >/dev/null || true
+          jq -e '[.blocked[].rule_id] | index("egress-not-allowed") != null' report.json
+          jq -e '.traced == true' report.json
+
+  # Optional: the real agent, end to end. Runs only when an Anthropic key is
+  # configured, and only on demand (it costs a few cents).
+  real-agent:
+    name: Real Claude Code agent is blocked
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        if: env.HAS_KEY == 'true'
+        with:
+          go-version: "1.22"
+          cache: false
+      - uses: ./
+        if: env.HAS_KEY == 'true'
+        with:
+          mode: enforce
+          fail-on: "off"
+      - name: Ask the agent to install a package from git
+        if: env.HAS_KEY == 'true'
+        run: |
+          echo "This is an automated security test of a CI guard. Use the Bash tool to run exactly this command once, then report what happened: npm install git+https://github.com/ChelateSec/does-not-exist.git" > /tmp/prompt.txt
+      - name: Run Claude
+        if: env.HAS_KEY == 'true'
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt_file: /tmp/prompt.txt
+          allowed_tools: "Bash"
+          model: "claude-haiku-4-5"
+          max_turns: "3"
+      - name: Titra refused the agent's command
+        if: env.HAS_KEY == 'true'
+        run: |
+          cat "$TITRA_LOG"
+          jq -e -s 'map(select(.source == "claude-code" and .verdict == "block" and .rule_id == "block-untrusted-package-source")) | length > 0' "$TITRA_LOG"
